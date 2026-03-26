@@ -1,0 +1,6 @@
+[submodule "mem_gen_offline_tester"]
+	path = mem_gen_offline_tester
+	url = https://github.com/Agent123123123/mem_gen_offline_tester.git
+[submodule "mem_predictor_offline_tester"]
+	path = mem_predictor_offline_tester
+	url = https://github.com/Agent123123123/mem_predictor_offline_tester.git

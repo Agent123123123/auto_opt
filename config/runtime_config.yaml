@@ -1,0 +1,136 @@
+# runtime_config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# 所有环境相关的超参数集中在此文件。
+# 不要把这些值硬编码在任何 Python 文件里。
+#
+# 使用方式：
+#   from config.runtime_config import load_runtime_config
+#   cfg = load_runtime_config()          # 加载 runtime_config.yaml
+#   cfg = load_runtime_config("my.yaml") # 指定路径
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Agent 模型配置 ────────────────────────────────────────────────────────────
+#
+# api_type 支持: anthropic | openai | azure_openai | bedrock
+#   - anthropic   : 直调 Anthropic API
+#   - openai      : 兼容 OpenAI 格式的 API（包括 GitHub Models、DashScope、本地 vllm 等）
+#   - azure_openai: Azure 托管的 GPT 系列
+#   - bedrock     : AWS Bedrock（Claude 系列）
+#
+# model       : litellm 模型字符串，格式: "<prefix>/<model_id>"
+#               - anthropic/...    → 直调 Anthropic
+#               - openai/...       → OpenAI 或任意 OpenAI-compatible 端点
+#               - gemini/...       → Google Gemini
+# api_base    : API 基础 URL；留空(~)则使用 api_type 对应的官方默认值
+# api_key_env : 存放 API Key 的环境变量名（不要把 key 直接写在这里）
+# max_tokens  : 最大输出 token 数
+# temperature : 采样温度
+
+agents:
+  # ── Task/Worker Agent — GLM5 via Alibaba Cloud DashScope (Anthropic-compatible) ──
+  task_agent:
+    model:        "anthropic/glm-5"                 # GLM-5 via DashScope Anthropic-compatible endpoint
+    api_type:     "anthropic"
+    api_base:     "https://coding.dashscope.aliyuncs.com/apps/anthropic"
+    api_key_env:  "OPT_TASK_AGENT_KEY"              # ← export OPT_TASK_AGENT_KEY=sk-sp-...
+    max_tokens:   8192
+    temperature:  0.5
+
+  # ── Judge Agent — GitHub Copilot Claude Sonnet 4.6 ──
+  judge_agent:
+    model:        "openai/claude-sonnet-4.6"       # Copilot API model name (dot, not dash)
+    api_type:     "openai"
+    api_base:     "https://api.githubcopilot.com"
+    api_key_env:  "GITHUB_TOKEN"                  # ← long-lived OAuth token (ghu_...) — used directly, no exchange needed
+    max_tokens:   4096
+    temperature:  0.0
+    extra_headers:                                 # Required by GitHub Copilot API
+      Copilot-Integration-Id:  "vscode-chat"
+      editor-version:          "vscode/1.95.0"
+      editor-plugin-version:   "copilot/1.243.0"
+      user-agent:              "GithubCopilot/1.243.0"
+
+  # ── Meta Agent — GitHub Copilot Claude Sonnet 4.6 ──
+  meta_agent:
+    model:        "openai/claude-sonnet-4.6"
+    api_type:     "openai"
+    api_base:     "https://api.githubcopilot.com"
+    api_key_env:  "GITHUB_TOKEN"                  # ← long-lived OAuth token (ghu_...) — used directly, no exchange needed
+    max_tokens:   8192
+    temperature:  0.7
+    extra_headers:                                 # Required by GitHub Copilot API
+      Copilot-Integration-Id:  "vscode-chat"
+      editor-version:          "vscode/1.95.0"
+      editor-plugin-version:   "copilot/1.243.0"
+      user-agent:              "GithubCopilot/1.243.0"
+
+# ── Memory Compiler 工具配置 ──────────────────────────────────────────────────
+#
+# binary     : memgen CLI 的绝对路径（或 PATH 里已有则直接 "memgen"）
+# binary_env : 若此环境变量存在，优先使用其值覆盖 binary（方便 CI/CD 注入）
+# use_mock   : true = 使用 mock_script 取代真实 MC（用于无 license 环境）
+# timeout_s  : 单次 memgen 调用超时（秒）
+#
+# ⚠️  discovery_flags 是 memgen 的能力发现 CLI 调用格式。
+#     不同版本的 memgen 可能用不同的子命令，按实际情况修改。
+
+tools:
+  memgen:
+    binary:         "memgen"           # 改为绝对路径，e.g. "/tools/mem_compiler/bin/memgen"
+    binary_env:     "MC_BINARY"        # export MC_BINARY=/path/to/memgen
+    use_mock:       false
+    mock_script:    "mem_gen_offline_tester/mock_mc.py"
+    timeout_s:      120
+    # memgen 能力发现命令（introspect 阶段使用）
+    discovery:
+      list_types_cmd:   ["memgen", "list-types", "--format", "json"]
+      describe_type_cmd: ["memgen", "describe", "--type", "{type}", "--format", "json"]
+      # 若 memgen 不支持 json 输出，改用 text 并配置解析正则
+      output_format:    "json"         # json | text
+
+  svlint:
+    binary:         "svlint"
+    binary_env:     "SVLINT_BINARY"
+
+# ── 路径配置 ─────────────────────────────────────────────────────────────────
+#
+# 支持绝对路径或相对路径（相对于 mem_solution/ 项目根目录）。
+# 支持 ${ENV_VAR} 语法（由 runtime_config.py 展开）。
+
+paths:
+  # 本地临时工作区根目录（每次 eval 会创建子目录）
+  workspace_root:       "/tmp/mem_gen_eval"
+
+  # memgen 行为模型目录（固定 golden，不随 skill 变化）
+  behavior_model_root:  "mem_gen_offline_tester/reference_models"
+
+  # mem_gen skill bundle（Meta Agent 修改目标）
+  skill_dir_gen:        "mem_gen/skill"
+
+  # mem_predict skill bundle
+  skill_dir_predict:    "mem_predict/skill"
+
+  # 进化 archive 根目录（各 phase 的子目录自动创建）
+  archive_root:         "runs/archive"
+
+  # memgen 能力 manifest 缓存文件（introspect 阶段写入，后续 phase 复用）
+  capability_manifest:  "runs/memgen_capability_manifest.json"
+
+# ── 能力发现行为 ─────────────────────────────────────────────────────────────
+#
+# 控制 memgen_introspect.py 在进化循环启动前如何发现 SRAM 覆盖范围。
+
+capability_discovery:
+  # auto   = 每次循环前自动调用 memgen 重新发现（推荐）
+  # cached = 复用上次 manifest（离线环境 / MC 无 license 时使用）
+  # manual = 完全跳过，使用 phase1a/config.py 里的静态列表
+  mode:               "auto"
+
+  # 若 memgen 不支持 JSON 输出，在此写 text 输出的解析正则
+  # key = memgen 原始字段；value = 解析正则（命名捕获组 "value"）
+  text_parse_patterns:
+    type_name:        '^\s*type\s*:\s*(?P<value>\S+)'
+    param_depth:      'nw\s*=\s*(?P<value>\d+)'
+    param_width:      'nb\s*=\s*(?P<value>\d+)'
+    param_mux:        'nmux\s*=\s*(?P<value>\d+)'
+    optional_pins:    'optional_pins\s*:\s*(?P<value>[^\n]+)'
