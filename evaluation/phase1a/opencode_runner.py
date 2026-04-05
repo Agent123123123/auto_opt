@@ -1,26 +1,20 @@
 """
 opencode_runner.py
 ------------------
-Run opencode agents via the ``opencode run --format json`` CLI, streaming
-JSON events from stdout in real time.
+Run opencode agents via agent_container for proper sandbox isolation.
 
-Each invocation spawns a fresh ``opencode run`` subprocess whose stdout
-emits one JSON object per line:
-
-  {"type":"step_start", ...}
-  {"type":"tool_use",   "part":{"type":"tool","tool":"bash","state":{...}}}
-  {"type":"text",       "part":{"type":"text","text":"..."}}
-  {"type":"step_finish","part":{"reason":"stop"|"tool-calls", "tokens":{...}}}
-
-Benefits over the old HTTP-serve approach:
-  - True real-time streaming — every event is visible as it happens.
-  - The subprocess can be killed if the agent hangs (no more un-cancellable
-    blocking HTTP POST).
-  - No server lifecycle to manage — each call is independent.
+Each invocation:
+  - Creates an isolated sandbox (HOME, XDG_*, copies workspace)
+  - Inherits host PATH and all env vars (module system, API keys, etc.)
+  - Runs ``opencode run --format json`` inside the sandbox
+  - After completion, syncs the sandbox workspace back to the original ``cwd``
+    so callers always find artifacts at their expected paths
+  - Returns the final text response (or result_file contents if specified)
 
 API surface (public)
 --------------------
-  run(prompt, cwd, model, chat_history_file, timeout, result_file) -> str
+  run(prompt, cwd, model, chat_history_file, timeout, result_file, agent) -> str
+  extract_json(text) -> str
 """
 
 from __future__ import annotations
@@ -29,28 +23,75 @@ import json
 import logging
 import os
 import re
-import subprocess
-import signal
-import tempfile
-import threading
-import time
+import shutil
+import sys
+import uuid
+from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("opencode_runner")
 
+# ---------------------------------------------------------------------------
+# agent_container import  (pip-installed package, or submodule fallback)
+# ---------------------------------------------------------------------------
+try:
+    from runner import ExperimentDefaults, ExperimentSpec, RunSpec, run_experiment_sync
+except ImportError:
+    _SUBMODULE_PATH = (Path(__file__).parent.parent / "agent_container").resolve()
+    if _SUBMODULE_PATH.exists():
+        sys.path.insert(0, str(_SUBMODULE_PATH))
+    from runner import ExperimentDefaults, ExperimentSpec, RunSpec, run_experiment_sync  # type: ignore[import]
+
+# Keys that agent_container injects with isolated values — exclude from passthrough
+# so they don't accidentally survive into run.env and override the isolation.
+_ISOLATED_ENV_KEYS = frozenset({
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+})
+
 
 # ---------------------------------------------------------------------------
-# Log formatting
+# Markdown log helpers  (post-process stdout.jsonl → human-readable markdown)
 # ---------------------------------------------------------------------------
+
+def _events_from_jsonl(jsonl_path: Path) -> tuple[list[dict], dict]:
+    """Parse agent_container's stdout.jsonl into (all_parts, total_tokens)."""
+    all_parts: list[dict] = []
+    total_tokens: dict = {}
+    try:
+        with jsonl_path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw_line in fh:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type", "")
+                part  = event.get("part", {})
+                if etype in ("tool_use", "text", "step_finish", "step_start", "reasoning"):
+                    all_parts.append(part)
+                    if etype == "step_finish":
+                        tokens = part.get("tokens", {})
+                        if tokens:
+                            total_tokens.update(tokens)
+    except Exception as exc:
+        log.warning("Could not read stdout.jsonl at %s: %s", jsonl_path, exc)
+    return all_parts, total_tokens
+
 
 def _format_log(prompt: str, messages: list, info: dict) -> str:
-    """Build a human-readable markdown log from the session messages."""
+    """Build a human-readable markdown log from session messages."""
     lines: list[str] = ["# opencode Session Log\n"]
     lines.append(f"## User Prompt\n\n```\n{prompt}\n```\n")
     lines.append("## Interaction\n")
 
     for msg in messages:
-        role = msg.get("info", {}).get("role", "?")
+        role  = msg.get("info", {}).get("role", "?")
         parts = msg.get("parts", [])
         lines.append(f"### [{role.upper()}]\n")
         for p in parts:
@@ -59,10 +100,10 @@ def _format_log(prompt: str, messages: list, info: dict) -> str:
                 lines.append(p.get("text", ""))
             elif ptype == "tool":
                 tool_name = p.get("tool", "?")
-                state = p.get("state", {})
-                inp = state.get("input", {})
-                out = state.get("output", "")
-                meta = state.get("metadata", {})
+                state     = p.get("state", {})
+                inp       = state.get("input", {})
+                out       = state.get("output", "")
+                meta      = state.get("metadata", {})
                 exit_code = meta.get("exit", "?")
                 lines.append(
                     f"**Tool: `{tool_name}`**\n"
@@ -72,7 +113,6 @@ def _format_log(prompt: str, messages: list, info: dict) -> str:
                 )
             elif ptype == "reasoning":
                 lines.append(f"*Reasoning:* {p.get('text', '')}")
-            # skip step-start / step-finish boilerplate
         lines.append("")
 
     tokens = info.get("tokens", {})
@@ -100,240 +140,123 @@ def run(
     agent: Optional[str] = None,
 ) -> str:
     """
-    Run an opencode agent via ``opencode run --format json`` and return the
-    final text response.
+    Run an opencode agent via agent_container (isolated sandbox) and return
+    the final text response.
 
-    Events are streamed in real time from the subprocess stdout.  Each JSON
-    line is parsed, logged, and accumulated into ``all_parts`` for the final
-    markdown log.
+    agent_container creates an isolated HOME and XDG directory tree per call
+    so opencode's SQLite state, config, and auth never leak between runs.
+    The sandbox workspace is a copy of ``cwd``; after the run it is synced
+    back so callers always find artifacts at their expected paths.
 
     Parameters
     ----------
     prompt : str
-        Full prompt (system instructions + user task) as one string.
+        Full prompt (system + user) as one string.
     cwd : str
-        Working directory for the opencode subprocess.
+        Working directory.  Copied to an isolated sandbox for the run,
+        then synced back here on completion.
     model : str
-        ``"providerID/modelID"`` e.g. ``"github-copilot/claude-sonnet-4.6"``.
+        ``"providerID/modelID"`` e.g. ``"dashscope/qwen-max"``.
     chat_history_file : str | None
-        If given, write a markdown interaction log here (including tool
-        calls and outputs).  Incremental snapshots are written as events
-        arrive so partial progress is visible even if the process dies.
+        If given, write a markdown interaction log here after the run.
+        A ``_raw.jsonl`` sibling is also written for deep debugging.
     timeout : int
-        Maximum wall-clock seconds before the subprocess is killed.
+        Maximum wall-clock seconds before the run is killed.
     result_file : str | None
-        If given, read this filename from ``cwd`` after the agent finishes
-        and return its contents instead of the final text response.
+        If given, read this filename from ``cwd`` after sync-back and return
+        its contents (used by judge/meta agents for structured output).
+    agent : str | None
+        opencode agent name, e.g. ``"no-skill"``.
     """
-    cmd = ["opencode", "run", "--format", "json"]
-    if agent:
-        cmd += ["--agent", agent]
-    if model:
-        cmd += ["--model", model]
-
-    log.info("opencode run  cwd=%s  model=%s  agent=%s  timeout=%ds  prompt_len=%d",
-             cwd, model, agent or "(default)", timeout, len(prompt))
-
-    # Ensure the target directory exists
+    cwd = os.path.abspath(cwd)
     os.makedirs(cwd, exist_ok=True)
 
-    # Linux ARG_MAX is typically ~2MB; passing a large prompt as a CLI arg fails
-    # with [Errno 7] Argument list too long.  For prompts over 64KB, write to a
-    # temp file and feed via stdin — opencode reads the message from stdin when
-    # no positional message arg is given.
-    _PROMPT_SIZE_LIMIT = 65536  # bytes
-    _stdin_fh = None  # file handle we own and must close after Popen
-    _prompt_tmp: Optional[str] = None
-    if len(prompt.encode()) > _PROMPT_SIZE_LIMIT:
-        _tf = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, encoding="utf-8", dir=cwd
-        )
-        _tf.write(prompt)
-        _tf.flush()
-        _tf.close()
-        _prompt_tmp = _tf.name
-        _stdin_fh = open(_prompt_tmp, encoding="utf-8")  # child inherits fd via fork
-        log.info("prompt > %dKB — writing to stdin (tmpfile: %s)",
-                 _PROMPT_SIZE_LIMIT // 1024, os.path.basename(_prompt_tmp))
-    else:
-        cmd.append(prompt)
+    run_id = "run"
+    exp_id = uuid.uuid4().hex[:12]
+    # Place agent_container artifacts in a sibling .ac_runs/ directory so they
+    # never pollute the workspace that gets synced back to cwd.
+    artifacts_root = os.path.join(os.path.dirname(cwd), ".ac_runs")
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=_stdin_fh if _stdin_fh is not None else subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            cwd=cwd,
-        )
-    except Exception as exc:
-        log.warning("Failed to start opencode run: %s", exc)
-        return ""
-    finally:
-        # Close our copy of the file handle; the child process keeps its own fd.
-        if _stdin_fh is not None:
-            _stdin_fh.close()
-        # Unlink the temp file (safe on Linux — child's fd keeps inode alive).
-        if _prompt_tmp is not None:
-            try:
-                os.unlink(_prompt_tmp)
-            except Exception:
-                pass
+    # Pass ALL current env vars except the ones agent_container replaces with
+    # isolated sandbox paths.  This preserves the module system (MODULEPATH,
+    # LMOD_*), API keys, LANG, TERM, and any other required host settings.
+    env_passthrough: dict[str, str] = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _ISOLATED_ENV_KEYS
+    }
 
-    # Collect all events for final log; track final text pieces
-    all_parts: list[dict] = []
-    final_texts: list[str] = []
-    total_tokens: dict = {}
-    last_activity = time.time()
-    snapshot_count = 0
-
-    def _write_snapshot() -> None:
-        """Write incremental chat history snapshot."""
-        nonlocal snapshot_count
-        if not chat_history_file:
-            return
-        try:
-            messages = [{"info": {"role": "assistant"}, "parts": all_parts}]
-            snap = _format_log(prompt, messages, {"tokens": total_tokens})
-            _dir = os.path.dirname(os.path.abspath(chat_history_file))
-            os.makedirs(_dir, exist_ok=True)
-            with open(chat_history_file, "w", encoding="utf-8") as fh:
-                fh.write(snap)
-            snapshot_count += 1
-        except Exception:
-            pass
-
-    # Drain stderr in a background thread so the pipe never blocks
-    stderr_lines: list[str] = []
-    def _drain_stderr():
-        try:
-            for line in proc.stderr:
-                stderr_lines.append(line.rstrip())
-        except Exception:
-            pass
-
-    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-    stderr_thread.start()
-
-    timed_out = False
-    try:
-        deadline = time.time() + timeout
-        for raw_line in proc.stdout:
-            raw_line = raw_line.strip()
-            if not raw_line:
-                continue
-
-            # Check timeout
-            now = time.time()
-            if now > deadline:
-                log.warning("opencode run timed out after %ds — killing", timeout)
-                timed_out = True
-                break
-
-            try:
-                event = json.loads(raw_line)
-            except json.JSONDecodeError:
-                log.debug("[stream] non-JSON line: %s", raw_line[:200])
-                continue
-
-            etype = event.get("type", "")
-            part = event.get("part", {})
-            last_activity = now
-
-            if etype == "tool_use":
-                all_parts.append(part)
-                tool_name = part.get("tool", "?")
-                state = part.get("state", {})
-                inp = state.get("input", {})
-                meta = state.get("metadata") or {}
-                cmd_snippet = (
-                    inp.get("command")
-                    or inp.get("path")
-                    or str(inp)
-                )[:120]
-                exit_code = meta.get("exit", "?")
-                out_snippet = str(meta.get("output", state.get("output", "")))[:200]
-                log.info(
-                    "[stream] tool=%s  cmd=%r  exit=%s\n"
-                    "         out=%r",
-                    tool_name, cmd_snippet, exit_code, out_snippet,
-                )
-                _write_snapshot()
-
-            elif etype == "text":
-                all_parts.append(part)
-                text = part.get("text", "")
-                if text.strip():
-                    final_texts.append(text)
-                    log.info("[stream] text: %r", text[:200])
-                _write_snapshot()
-
-            elif etype == "step_finish":
-                all_parts.append(part)
-                tokens = part.get("tokens", {})
-                if tokens:
-                    total_tokens.update(tokens)
-                reason = part.get("reason", "?")
-                log.info(
-                    "[stream] step_finish reason=%s  tokens=%s",
-                    reason, json.dumps(tokens),
-                )
-
-            elif etype == "step_start":
-                all_parts.append(part)
-
-            elif etype == "reasoning":
-                all_parts.append(part)
-
-            elif etype == "error":
-                err = event.get("error", {})
-                err_msg = err.get("data", {}).get("message", str(err))
-                log.warning("[stream] error event: %s", err_msg)
-
-            else:
-                # Unknown event type — store but don't log verbosely
-                all_parts.append(part)
-
-    except Exception as exc:
-        log.warning("Error reading opencode stdout: %s", exc)
-    finally:
-        if timed_out or proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        else:
-            proc.wait()
-
-    exit_code_proc = proc.returncode
-    log.info(
-        "opencode run finished  exit=%s  parts=%d  timed_out=%s",
-        exit_code_proc, len(all_parts), timed_out,
+    spec = ExperimentSpec(
+        id=exp_id,
+        name="opencode_runner",
+        workspace=cwd,
+        inherit_auth=True,
+        artifacts_root=artifacts_root,
+        defaults=ExperimentDefaults(
+            platform="opencode",
+            timeout_seconds=timeout,
+            agent=agent,
+            model=model,
+        ),
+        runs=[
+            RunSpec(
+                run_id=run_id,
+                candidate_id="run",
+                prompt=prompt,
+                env=env_passthrough,
+            )
+        ],
     )
 
-    # ── Final chat history write ──────────────────────────────────────────
+    log.info(
+        "opencode run  cwd=%s  model=%s  agent=%s  timeout=%ds  prompt_len=%d",
+        cwd, model, agent or "(default)", timeout, len(prompt),
+    )
+
+    experiment_result = run_experiment_sync(spec)
+    run_result = experiment_result.results[0]
+
+    log.info(
+        "opencode run finished  status=%s  exit=%s  duration_ms=%d",
+        run_result.status, run_result.exit_code, run_result.duration_ms,
+    )
+
+    # ── Locate the sandbox workspace ──────────────────────────────────────
+    sandbox_workspace = (
+        Path(experiment_result.artifact_root)
+        / "runs" / run_id / "sandbox" / "workspace"
+    )
+
+    # ── Sync sandbox workspace → original cwd ────────────────────────────
+    # Every file the agent wrote in the sandbox becomes visible at the
+    # original cwd, so downstream callers don't need sandbox-awareness.
+    if sandbox_workspace.exists():
+        shutil.copytree(str(sandbox_workspace), cwd, dirs_exist_ok=True)
+        log.info("Synced sandbox workspace → %s", cwd)
+    else:
+        log.warning("Sandbox workspace not found at %s", sandbox_workspace)
+
+    # ── Write chat history log ────────────────────────────────────────────
     if chat_history_file:
-        messages = [{"info": {"role": "assistant"}, "parts": all_parts}]
-        log_content = _format_log(prompt, messages, {"tokens": total_tokens})
-        os.makedirs(
-            os.path.dirname(os.path.abspath(chat_history_file)), exist_ok=True
-        )
-        with open(chat_history_file, "w", encoding="utf-8") as fh:
-            fh.write(log_content)
+        stdout_jsonl_str = run_result.artifact_paths.get("stdout_jsonl", "")
+        stdout_jsonl = Path(stdout_jsonl_str) if stdout_jsonl_str else None
+        if stdout_jsonl and stdout_jsonl.exists():
+            all_parts, total_tokens = _events_from_jsonl(stdout_jsonl)
+            messages = [{"info": {"role": "assistant"}, "parts": all_parts}]
+            log_md = _format_log(prompt, messages, {"tokens": total_tokens})
+            os.makedirs(
+                os.path.dirname(os.path.abspath(chat_history_file)), exist_ok=True
+            )
+            with open(chat_history_file, "w", encoding="utf-8") as fh:
+                fh.write(log_md)
+            # Copy raw events JSONL alongside the markdown for deep debugging
+            raw_jsonl_path = chat_history_file.rsplit(".", 1)[0] + "_raw.jsonl"
+            try:
+                shutil.copy2(str(stdout_jsonl), raw_jsonl_path)
+            except Exception as exc:
+                log.warning("Could not copy stdout_jsonl: %s", exc)
 
-        # Save raw events JSON for deep debugging
-        raw_json_path = chat_history_file.rsplit(".", 1)[0] + "_raw.json"
-        try:
-            with open(raw_json_path, "w", encoding="utf-8") as fh:
-                json.dump(all_parts, fh, indent=2, ensure_ascii=False)
-        except Exception as exc:
-            log.warning("Could not write raw events JSON: %s", exc)
-
-    # ── Read result file if requested ─────────────────────────────────────
+    # ── Read result_file if requested ─────────────────────────────────────
     if result_file:
         result_path = os.path.join(cwd, result_file)
         if os.path.exists(result_path):
@@ -344,11 +267,14 @@ def run(
             result_file, cwd,
         )
 
-    return "\n".join(final_texts)
+    # ── Return final text from the normalized session ─────────────────────
+    if run_result.normalized_session:
+        return run_result.normalized_session.final_output_text or ""
+    return ""
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction helper (for judge_agent)
+# JSON extraction helper (used by judge_agent)
 # ---------------------------------------------------------------------------
 
 def extract_json(text: str) -> str:

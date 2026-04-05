@@ -4,3 +4,6 @@
 [submodule "mem_predictor_offline_tester"]
 	path = mem_predictor_offline_tester
 	url = https://github.com/Agent123123123/mem_predictor_offline_tester.git
+[submodule "evaluation/agent_container"]
+	path = evaluation/agent_container
+	url = https://github.com/Agent123123123/agent_container
