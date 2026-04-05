@@ -5,7 +5,8 @@
       "mode": "primary",
       "description": "Primary agent with skill tool disabled (for automated pipelines that manage their own context)",
       "permission": {
-        "skill": "deny"
+        "skill": "deny",
+        "external_directory": "allow"
       }
     }
   }
