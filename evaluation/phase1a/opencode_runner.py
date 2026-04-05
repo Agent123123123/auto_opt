@@ -133,7 +133,19 @@ def run(
         / "runs" / run_id / "sandbox" / "workspace"
     )
     if sandbox_workspace.exists():
-        shutil.copytree(str(sandbox_workspace), cwd, dirs_exist_ok=True)
+        try:
+            shutil.copytree(str(sandbox_workspace), cwd, dirs_exist_ok=True)
+        except shutil.Error as exc:
+            # Filter out "same file" errors, which happen when both sandbox and
+            # real workspace contain symlinks pointing to the same external file
+            # (e.g. .mco foundry library objects).  These are benign.
+            real_errors = [
+                e for e in exc.args[0]
+                if "same file" not in str(e).lower()
+            ]
+            if real_errors:
+                raise shutil.Error(real_errors) from exc
+            log.debug("copytree: ignoring %d 'same file' symlink collision(s)", len(exc.args[0]))
         log.info("Synced sandbox workspace → %s", cwd)
     else:
         log.warning("Sandbox workspace not found at %s", sandbox_workspace)
