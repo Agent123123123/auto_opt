@@ -169,9 +169,7 @@ def run(
                 fh.write(f"- messages   : {stats.message_count}\n")
                 fh.write(f"- tool calls : {stats.tool_call_count}\n")
                 fh.write(f"- skills used: {stats.skills_used}\n")
-                if stats.token_usage:
-                    tu = stats.token_usage
-                    fh.write(f"- tokens     : total={tu.total} input={tu.input} output={tu.output}\n")
+
                 fh.write(f"\n## Final Output\n\n")
                 fh.write(ns.final_output_text or "(no output)")
                 fh.write("\n")
