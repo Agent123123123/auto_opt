@@ -25,7 +25,7 @@ from typing import Optional
 class ArchiveEntry:
     generation:  int
     score:       float
-    metrics:     dict        # {"artifact_completeness": 0.9, "wrapper_interface_match": 0.8, ...}
+    metrics:     dict        # {"artifact_completeness": 0.9, "param_toggle_correctness": 1.0, ...}
     parent_id:   Optional[int]
     skill_path:  str         # 快照目录路径
     judge_report: dict = field(default_factory=dict)
@@ -109,7 +109,7 @@ class Archive:
         # 从 reports 提取 layer1 metric 均值
         metrics: dict = {}
         layer1_keys = [
-            "artifact_completeness", "wrapper_interface_match",
+            "artifact_completeness",
             "param_toggle_correctness", "split_correctness",
             "tiein_correctness", "mem_type_full_coverage",
             "interface_spec_consistency", "lint_clean_rate",

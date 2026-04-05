@@ -109,6 +109,7 @@ def load_agent_model_config(
 
     return {
         "model":         agent_raw["model"],
+        "opencode_model": agent_raw.get("opencode_model", agent_raw["model"]),
         "api_base":      api_base,
         "api_key":       api_key,
         "extra_headers": extra_headers,

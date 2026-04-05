@@ -27,42 +27,35 @@
 # temperature : 采样温度
 
 agents:
-  # ── Task/Worker Agent — GLM5 via Alibaba Cloud DashScope (Anthropic-compatible) ──
+  # ── Task/Worker Agent — DashScope GLM-5 (anthropic compat) ──
   task_agent:
-    model:        "anthropic/glm-5"                 # GLM-5 via DashScope Anthropic-compatible endpoint
+    model:          "anthropic/glm-5"
+    opencode_model: "bailian-coding-plan/glm-5"
     api_type:     "anthropic"
     api_base:     "https://coding.dashscope.aliyuncs.com/apps/anthropic"
-    api_key_env:  "OPT_TASK_AGENT_KEY"              # ← export OPT_TASK_AGENT_KEY=sk-sp-...
+    api_key_env:  "OPT_TASK_AGENT_KEY"
     max_tokens:   8192
     temperature:  0.5
 
   # ── Judge Agent — GitHub Copilot Claude Sonnet 4.6 ──
   judge_agent:
-    model:        "openai/claude-sonnet-4.6"       # Copilot API model name (dot, not dash)
-    api_type:     "openai"
+    model:          "openai/claude-sonnet-4.6"
+    opencode_model: "github-copilot/claude-sonnet-4.6"
+    api_type:     "copilot"
     api_base:     "https://api.githubcopilot.com"
-    api_key_env:  "GITHUB_TOKEN"                  # ← long-lived OAuth token (ghu_...) — used directly, no exchange needed
+    api_key_env:  "GITHUB_TOKEN"
     max_tokens:   4096
     temperature:  0.0
-    extra_headers:                                 # Required by GitHub Copilot API
-      Copilot-Integration-Id:  "vscode-chat"
-      editor-version:          "vscode/1.95.0"
-      editor-plugin-version:   "copilot/1.243.0"
-      user-agent:              "GithubCopilot/1.243.0"
 
   # ── Meta Agent — GitHub Copilot Claude Sonnet 4.6 ──
   meta_agent:
-    model:        "openai/claude-sonnet-4.6"
-    api_type:     "openai"
+    model:          "openai/claude-sonnet-4.6"
+    opencode_model: "github-copilot/claude-sonnet-4.6"
+    api_type:     "copilot"
     api_base:     "https://api.githubcopilot.com"
-    api_key_env:  "GITHUB_TOKEN"                  # ← long-lived OAuth token (ghu_...) — used directly, no exchange needed
+    api_key_env:  "GITHUB_TOKEN"
     max_tokens:   8192
     temperature:  0.7
-    extra_headers:                                 # Required by GitHub Copilot API
-      Copilot-Integration-Id:  "vscode-chat"
-      editor-version:          "vscode/1.95.0"
-      editor-plugin-version:   "copilot/1.243.0"
-      user-agent:              "GithubCopilot/1.243.0"
 
 # ── Memory Compiler 工具配置 ──────────────────────────────────────────────────
 #

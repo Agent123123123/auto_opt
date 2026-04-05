@@ -6,7 +6,7 @@ Phase 1a Task Agent
 接收信息：
   - mem_gen skill 文档全文（SKILL.md + 所有 0x_*.md）
   - memory_type   (e.g. "spsram_ulvt")
-  - mc_path       (MC 编译器路径或 mock 入口)
+  - mc_path       (MC 编译器路径，若为 None 则由 Agent 自行发现)
   - workspace_dir (本代运行的独立工作目录)
 
 产出：
@@ -27,58 +27,60 @@ import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
 
-from agent.llm_withtools import run_agent_to_completion
-from agent.tools import load_tools
-from utils.skill_loader import load_skill_bundle
+from phase1a.opencode_runner import run as opencode_run
+from phase1a.config import get_language_directive
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Prompt 模板
 # ──────────────────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an expert hardware infrastructure engineer specializing in SRAM memory \
-compiler integration. Your job is to follow the provided skill document exactly \
-and produce all required artifacts for a given memory type.
+You are an expert hardware infrastructure engineer. Your job is to build a \
+production-quality Memory Compiler CLI wrapper from scratch, following the \
+methodology in the provided skill documents.
 
-CRITICAL RULES:
-1. Follow the skill document step-by-step. Do not skip steps.
-2. If you encounter an error, diagnose it using the bash tool and retry.
-3. All file output must go to the workspace directory provided.
-4. When done, write a file called DONE.txt in the workspace root listing all \
-   produced artifact paths, one per line.
-5. Do NOT invent parameter values not covered by the skill document.
+Read the skill documents carefully before starting. They contain the \
+complete methodology, pitfalls, and best practices you need.
 """
 
 TASK_PROMPT_TEMPLATE = """\
 ## Your Task
 
-Build the memory compiler wrapper for the following target:
+Build a **Memory Compiler CLI tool** (`memgen`) following the methodology in
+the skill documents. Read them first, then implement and test the tool.
 
-- **Memory type**: {memory_type}
-- **MC compiler path**: {mc_path}
-- **Workspace directory**: {workspace_dir}
-- **Parameter combinations to cover**: {param_combos}
+## Environment
 
-## Skill Document
+- **Workspace directory**: `{workspace_dir}`  ← all output goes here
+- **Skill documents**: `{skill_dir}`
+- **Memory Compiler**:
+  - Load with: `module load mc2_n12/2013.12`
+  - Family packages base: `/data/foundry/TSMC12/Memory_compiler/`
 
-The following is your complete instruction set. Read it carefully before acting.
+## Required Output Layout (MANDATORY — evaluator checks ONLY this path)
 
----
-{skill_content}
----
+All MC artifacts MUST be placed at:
 
-## Expected Artifacts
+    {workspace_dir}/artifacts/<memory_family>/<combo_name>/
 
-For each parameter combination in the list above, produce:
-  - RTL wrapper (.sv or .v)
-  - DATASHEET file (DATASHEET_<combo>.txt)
-  - Compilation kit (LEF, LIB, GDS) if the MC compiler supports it
+Examples:
+    {workspace_dir}/artifacts/spsram/ts1n12ffcllulvta64x16m4sw_130b/
+    {workspace_dir}/artifacts/1prf/ts5n12ffcllulvta16x32m1sw_130c/
 
-Place all outputs under: `{workspace_dir}/artifacts/{memory_type}/<combo>/`
+Rules:
+- The top-level directory inside `{workspace_dir}` for artifacts is `artifacts/`
+- Directly under `artifacts/` is the memory family name (e.g. `spsram`, `1prf`)
+- Under each family is the combo/model name
+- Do NOT use `test_output/`, `output/`, `results/`, or any other intermediate
+  directory. The evaluator ONLY scans `{workspace_dir}/artifacts/` — outputs
+  placed elsewhere are INVISIBLE to scoring.
 
-Write `{workspace_dir}/DONE.txt` when complete, listing all produced files.
+## Completion Criterion
 
-Begin now.
+Write `{workspace_dir}/DONE.txt` listing every produced artifact path (one per
+line). Do NOT write DONE.txt if no real MC artifacts were produced.
+
+Begin by reading the skill docs, then build and run the tool.
 """
 
 
@@ -87,38 +89,34 @@ class TaskAgent:
 
     def __init__(self, model_config: dict, chat_history_file: str = "./outputs/task_chat.md"):
         self.model_config = model_config
-        self.tools = load_tools(["bash"])  # Task Agent 只有 bash 工具
         self.chat_history_file = chat_history_file
 
     def forward(self, inputs: dict) -> tuple[str, list]:
         """
         inputs keys:
-            memory_type   : str
-            mc_path       : str
-            workspace_dir : str
-            param_combos  : list[str]   e.g. ["NW4_NB32_NMUX4", "NW8_NB64_NMUX4", ...]
-            skill_dir     : str         path to mem_gen/skill/
+            workspace_dir      : str
+            skill_dir          : str
+            chat_history_file  : str (optional)
+            mc_path            : str | None  (unused — MC paths are hardcoded in prompt)
         """
-        skill_content = load_skill_bundle(inputs["skill_dir"])
-
         task_prompt = TASK_PROMPT_TEMPLATE.format(
-            memory_type   = inputs["memory_type"],
-            mc_path       = inputs["mc_path"],
             workspace_dir = inputs["workspace_dir"],
-            param_combos  = "\n".join(f"  - {c}" for c in inputs["param_combos"]),
-            skill_content = skill_content,
+            skill_dir     = inputs["skill_dir"],
         )
 
-        messages = [{"role": "user", "content": task_prompt}]
+        # opencode runs the full agentic tool loop (bash) internally.
+        # Combine system + user prompts as one message.
+        lang_directive = get_language_directive()
+        full_prompt = (lang_directive + "\n\n" + SYSTEM_PROMPT + "\n\n" + task_prompt).lstrip()
 
-        final_response, history = run_agent_to_completion(
-            model             = self.model_config["model"],
-            system_prompt     = SYSTEM_PROMPT,
-            messages          = messages,
-            tools             = self.tools,
-            max_steps         = 40,
-            chat_history_file = self.chat_history_file,
-            api_base          = self.model_config.get("api_base"),
-            api_key           = self.model_config.get("api_key"),
+        chat_history_file = inputs.get("chat_history_file", self.chat_history_file)
+
+        final_response = opencode_run(
+            prompt            = full_prompt,
+            cwd               = inputs["workspace_dir"],
+            model             = self.model_config["opencode_model"],
+            chat_history_file = chat_history_file,
+            timeout           = 7200,   # 120 min
+            agent             = "no-skill",
         )
-        return final_response, history
+        return final_response, []
