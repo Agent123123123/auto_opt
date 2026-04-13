@@ -212,8 +212,8 @@ JSON schema to write:
 
 ## 9. Task Agent Work Log
 
-File: `{task_chat_file}`
-Use `tail -150 {task_chat_file}` to read the task agent's execution log before writing your assessment.
+`task_chat.md` is symlinked in your current working directory.
+Use `bash: cat task_chat.md` to read the task agent's execution log before writing your assessment.
 """
 
 # Judge Agent class
@@ -311,7 +311,6 @@ class JudgeAgent:
                 f'"{k}": {len(v)}' for k, v in sorted(tool_results["family_combos"].items())
             ),
             skill_dir                 = inputs.get("skill_dir", "(not provided)"),
-            task_chat_file            = inputs.get("task_chat_file") or "(not provided)",
         )
 
         # ── Step 4: LLM interprets + scores (via opencode) ────────────────────

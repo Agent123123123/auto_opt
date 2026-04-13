@@ -18,6 +18,7 @@ Public API
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -28,23 +29,17 @@ from typing import Optional
 
 log = logging.getLogger("opencode_runner")
 
+
 # ---------------------------------------------------------------------------
 # agent_container import
 # ---------------------------------------------------------------------------
 try:
-    from runner import ExperimentDefaults, ExperimentSpec, RunSpec, run_experiment_sync
+    from runner import CallCapabilities, CallEnvironment, CallExecution, CallInputs, CallSpec, CallTarget, call_once_sync
 except ImportError:
     _SUBMODULE_PATH = (Path(__file__).parent.parent / "agent_container").resolve()
     if _SUBMODULE_PATH.exists():
         sys.path.insert(0, str(_SUBMODULE_PATH))
-    from runner import ExperimentDefaults, ExperimentSpec, RunSpec, run_experiment_sync  # type: ignore[import]
-
-# Keys agent_container injects with isolated values — exclude from passthrough.
-_ISOLATED_ENV_KEYS = frozenset({
-    "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
-    "XDG_STATE_HOME", "XDG_CACHE_HOME",
-})
-
+    from runner import CallCapabilities, CallEnvironment, CallExecution, CallInputs, CallSpec, CallTarget, call_once_sync  # type: ignore[import]
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -89,29 +84,25 @@ def run(
     cwd = os.path.abspath(cwd)
     os.makedirs(cwd, exist_ok=True)
 
-    run_id         = "run"
-    exp_id         = uuid.uuid4().hex[:12]
+    call_id        = uuid.uuid4().hex[:12]
     artifacts_root = os.path.join(os.path.dirname(cwd), ".ac_runs")
 
-    # Forward entire env except keys the sandbox will override.
-    env_passthrough: dict[str, str] = {
-        k: v for k, v in os.environ.items()
-        if k not in _ISOLATED_ENV_KEYS
-    }
-
-    spec = ExperimentSpec(
-        id=exp_id,
-        name="opencode_runner",
-        workspace=cwd,
-        inherit_auth=True,
-        artifacts_root=artifacts_root,
-        defaults=ExperimentDefaults(
+    spec = CallSpec(
+        call_id=call_id,
+        target=CallTarget(
             platform="opencode",
-            timeout_seconds=timeout,
             agent=agent,
             model=model,
         ),
-        runs=[RunSpec(run_id=run_id, candidate_id="run", prompt=prompt, env=env_passthrough)],
+        inputs=CallInputs(prompt=prompt),
+        environment=CallEnvironment(
+            workspace=cwd,
+            inherit_auth=True,
+        ),
+        execution=CallExecution(
+            timeout_seconds=timeout,
+            artifacts_root=artifacts_root,
+        ),
     )
 
     log.info(
@@ -119,8 +110,17 @@ def run(
         cwd, model, agent or "(default)", timeout, len(prompt),
     )
 
-    experiment_result = run_experiment_sync(spec)
-    run_result        = experiment_result.results[0]
+    # ── Pre-run: symlink chat_history_file → stream.md for live viewing ──
+    # call_id is known here, so stream.md path is deterministic.
+    # The symlink persists after the run — it always points to the real file.
+    if chat_history_file:
+        _stream_md_path = str(Path(artifacts_root) / call_id / "stream.md")
+        os.makedirs(os.path.dirname(os.path.abspath(chat_history_file)), exist_ok=True)
+        if os.path.lexists(chat_history_file):
+            os.remove(chat_history_file)
+        os.symlink(_stream_md_path, chat_history_file)
+
+    run_result = call_once_sync(spec)
 
     log.info(
         "opencode run finished  status=%s  exit=%s  duration_ms=%d",
@@ -128,36 +128,39 @@ def run(
     )
 
     # ── Sync sandbox workspace → original cwd ────────────────────────────
-    sandbox_workspace = (
-        Path(experiment_result.artifact_root)
-        / "runs" / run_id / "sandbox" / "workspace"
-    )
+    # Do this BEFORE checking for errors: the task agent may have completed its
+    # work successfully even if the post-run session export/parse step failed.
+    sandbox_workspace = Path(run_result.artifact_root) / "sandbox" / "workspace"
     if sandbox_workspace.exists():
+        def _safe_copy2(src, dst, **kwargs):
+            """copy2 wrapper that silently skips same-file errors (symlinks to
+            shared foundry objects like .mco files that appear in multiple combo
+            subdirs but point to the same inode)."""
+            try:
+                shutil.copy2(src, dst, **kwargs)
+            except shutil.SameFileError:
+                pass  # benign: src and dst are the same underlying file
+
         try:
-            shutil.copytree(str(sandbox_workspace), cwd, dirs_exist_ok=True)
+            shutil.copytree(
+                str(sandbox_workspace), cwd,
+                dirs_exist_ok=True,
+                copy_function=_safe_copy2,
+            )
         except shutil.Error as exc:
-            # Filter out "same file" errors, which happen when both sandbox and
-            # real workspace contain symlinks pointing to the same external file
-            # (e.g. .mco foundry library objects).  These are benign.
-            real_errors = [
-                e for e in exc.args[0]
-                if "same file" not in str(e).lower()
-            ]
-            if real_errors:
-                raise shutil.Error(real_errors) from exc
-            log.debug("copytree: ignoring %d 'same file' symlink collision(s)", len(exc.args[0]))
+            # Catch any remaining multi-file errors; re-raise only non-same-file ones.
+            full_msg = str(exc)
+            if "same file" not in full_msg.lower():
+                raise
+            log.debug("copytree: suppressed 'same file' symlink collision(s)")
         log.info("Synced sandbox workspace → %s", cwd)
     else:
         log.warning("Sandbox workspace not found at %s", sandbox_workspace)
 
-    # ── Chat history: copy stdout.jsonl + write session summary ──────────
+    # ── Copy raw stdout.jsonl for debugging ──────────────────────────────
     if chat_history_file:
         stdout_jsonl_str = run_result.artifact_paths.get("stdout_jsonl", "")
         stdout_jsonl     = Path(stdout_jsonl_str) if stdout_jsonl_str else None
-
-        os.makedirs(os.path.dirname(os.path.abspath(chat_history_file)), exist_ok=True)
-
-        # Copy raw events alongside the chat history for debugging
         if stdout_jsonl and stdout_jsonl.exists():
             raw_path = chat_history_file.rsplit(".", 1)[0] + "_raw.jsonl"
             try:
@@ -165,26 +168,25 @@ def run(
             except Exception as exc:
                 log.warning("Could not copy stdout.jsonl: %s", exc)
 
-        # Write markdown summary from NormalizedSession
-        with open(chat_history_file, "w", encoding="utf-8") as fh:
-            fh.write(f"# opencode Session — {exp_id}\n\n")
-            fh.write(f"- status : {run_result.status}\n")
-            fh.write(f"- exit   : {run_result.exit_code}\n")
-            fh.write(f"- ms     : {run_result.duration_ms}\n")
-            fh.write(f"- session: {run_result.session_id or '(none)'}\n\n")
-            if run_result.error:
-                fh.write(f"> **Error**: {run_result.error}\n\n")
-            ns = run_result.normalized_session
-            if ns:
-                stats = ns.stats
-                fh.write(f"## Stats\n\n")
-                fh.write(f"- messages   : {stats.message_count}\n")
-                fh.write(f"- tool calls : {stats.tool_call_count}\n")
-                fh.write(f"- skills used: {stats.skills_used}\n")
-
-                fh.write(f"\n## Final Output\n\n")
-                fh.write(ns.final_output_text or "(no output)")
-                fh.write("\n")
+    # ── Fail hard only on real execution errors (not post-run artifact issues) ──
+    # Session export/parse failures mean opencode ran fine but its session JSON
+    # was malformed/truncated (common with very long MiniMax sessions).  The
+    # workspace is already synced, so we can still return results from files.
+    _ARTIFACT_ERRORS = ("session export", "normalized session", "session export parse")
+    if run_result.error:
+        is_artifact_only = all(
+            any(tag in part for tag in _ARTIFACT_ERRORS)
+            for part in run_result.error.split(";")
+            if part.strip()
+        )
+        if not is_artifact_only:
+            raise RuntimeError(
+                f"opencode run failed (status={run_result.status}): {run_result.error}"
+            )
+        log.warning(
+            "opencode session export/parse failed (workspace already synced, continuing): %s",
+            run_result.error,
+        )
 
     # ── Read result_file if requested ─────────────────────────────────────
     if result_file:

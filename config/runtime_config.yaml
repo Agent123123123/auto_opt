@@ -11,51 +11,22 @@
 
 # ── Agent 模型配置 ────────────────────────────────────────────────────────────
 #
-# api_type 支持: anthropic | openai | azure_openai | bedrock
-#   - anthropic   : 直调 Anthropic API
-#   - openai      : 兼容 OpenAI 格式的 API（包括 GitHub Models、DashScope、本地 vllm 等）
-#   - azure_openai: Azure 托管的 GPT 系列
-#   - bedrock     : AWS Bedrock（Claude 系列）
-#
-# model       : litellm 模型字符串，格式: "<prefix>/<model_id>"
-#               - anthropic/...    → 直调 Anthropic
-#               - openai/...       → OpenAI 或任意 OpenAI-compatible 端点
-#               - gemini/...       → Google Gemini
-# api_base    : API 基础 URL；留空(~)则使用 api_type 对应的官方默认值
-# api_key_env : 存放 API Key 的环境变量名（不要把 key 直接写在这里）
-# max_tokens  : 最大输出 token 数
-# temperature : 采样温度
+# opencode_model : opencode 模型字符串，格式 "<providerID>/<modelID>"
+#                  例: "bailian-coding-plan/glm-5"、"copilot-direct/claude-sonnet-4.6"
+# api_key_env    : 存放 API Key 的环境变量名（不要把 key 直接写在这里）
 
 agents:
-  # ── Task/Worker Agent — DashScope GLM-5 (anthropic compat) ──
+  # ── Task/Worker Agent — MiniMax M2.7 Highspeed ──
   task_agent:
-    model:          "anthropic/glm-5"
-    opencode_model: "bailian-coding-plan/glm-5"
-    api_type:     "anthropic"
-    api_base:     "https://coding.dashscope.aliyuncs.com/apps/anthropic"
-    api_key_env:  "OPT_TASK_AGENT_KEY"
-    max_tokens:   8192
-    temperature:  0.5
+    opencode_model: "minimax-cn-coding-plan/MiniMax-M2.7-highspeed"
 
-  # ── Judge Agent — GitHub Copilot Claude Sonnet 4.6 ──
+  # ── Judge Agent — MiniMax M2.7 Highspeed ──
   judge_agent:
-    model:          "openai/claude-sonnet-4.6"
-    opencode_model: "github-copilot/claude-sonnet-4.6"
-    api_type:     "copilot"
-    api_base:     "https://api.githubcopilot.com"
-    api_key_env:  "GITHUB_TOKEN"
-    max_tokens:   4096
-    temperature:  0.0
+    opencode_model: "minimax-cn-coding-plan/MiniMax-M2.7-highspeed"
 
-  # ── Meta Agent — GitHub Copilot Claude Sonnet 4.6 ──
+  # ── Meta Agent — MiniMax M2.7 Highspeed ──
   meta_agent:
-    model:          "openai/claude-sonnet-4.6"
-    opencode_model: "github-copilot/claude-sonnet-4.6"
-    api_type:     "copilot"
-    api_base:     "https://api.githubcopilot.com"
-    api_key_env:  "GITHUB_TOKEN"
-    max_tokens:   8192
-    temperature:  0.7
+    opencode_model: "minimax-cn-coding-plan/MiniMax-M2.7-highspeed"
 
 # ── Memory Compiler 工具配置 ──────────────────────────────────────────────────
 #

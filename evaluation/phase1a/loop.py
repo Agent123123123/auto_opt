@@ -76,9 +76,10 @@ def run_phase1a(
     judge_agent = JudgeAgent(model_config=judge_cfg)
     meta_agent  = MetaAgent(model_config=meta_cfg)
 
-    best_score       = 0.0
-    stagnation_count = 0
-    eval_history     = []   # 最近 8 代的 judge 报告
+    best_score           = 0.0
+    stagnation_count     = 0
+    consecutive_failures = 0   # 连续 task-agent 失败次数，达到 3 即中止
+    eval_history         = []   # 最近 8 代的 judge 报告
 
     cfg = PHASE1A_CONFIG
 
@@ -96,27 +97,55 @@ def run_phase1a(
         # 第一代时 archive 为空，fallback 到原始 skill_dir（submodule）
         parent_skill_dir = archive.select_parent() or skill_dir
         working_skill_dir = os.path.abspath(os.path.join(gen_dir, "skill"))
-        shutil.copytree(parent_skill_dir, working_skill_dir)
+        # Exclude symlinked log files so they don't pollute the next generation's skill dir
+        shutil.copytree(parent_skill_dir, working_skill_dir,
+                        ignore=shutil.ignore_patterns('task_chat.md', 'judge_chat.md'))
 
         # ── Step 2: Task Agent — builds CLI tool, discovers MC, runs all tests ─
         workspace = os.path.abspath(os.path.join(gen_dir, "workspace"))
         os.makedirs(workspace, exist_ok=True)
 
         task_chat = os.path.abspath(os.path.join(gen_dir, "task_chat.md"))
-        task_agent.forward({
-            "workspace_dir":     workspace,
-            "skill_dir":         working_skill_dir,
-            "chat_history_file": task_chat,
-        })
+        try:
+            task_agent.forward({
+                "workspace_dir":     workspace,
+                "skill_dir":         working_skill_dir,
+                "chat_history_file": task_chat,
+            })
+        except Exception as exc:
+            log.error(f"  Task agent failed (skipping gen): {exc}")
+            archive.add(generation=generation, score=0.0, metrics={}, judge_report={"error": str(exc), "score": 0.0, "breakdown": {}})
+            consecutive_failures += 1
+            stagnation_count += 1
+            log.info(f"  · No improvement (stagnation={stagnation_count})")
+            if consecutive_failures >= 3:
+                log.error(f"  ✗ 3 consecutive task-agent failures — aborting run.")
+                break
+            if stagnation_count >= cfg["stagnation_limit"]:
+                log.info(f"  ✗ Stagnation limit reached. Stopping.")
+                break
+            continue
+
+        consecutive_failures = 0  # 此代 task agent 成功，重置连续失败计数
+
+        # Symlink task_chat.md into judge workspace so it can read it within sandbox
+        # Must use absolute path — relative symlinks break inside agent_container sandbox
+        _link = os.path.join(workspace, "task_chat.md")
+        if not os.path.lexists(_link):
+            os.symlink(task_chat, _link)
 
         # ── Step 3: Judge Agent — single global workspace evaluation ──────────
         judge_chat = os.path.abspath(os.path.join(gen_dir, "judge_chat.md"))
-        report = judge_agent.evaluate({
-            "workspace_dir":     workspace,
-            "skill_dir":         working_skill_dir,
-            "chat_history_file": judge_chat,
-            "task_chat_file":    task_chat,
-        })
+        try:
+            report = judge_agent.evaluate({
+                "workspace_dir":     workspace,
+                "skill_dir":         working_skill_dir,
+                "chat_history_file": judge_chat,
+                "task_chat_file":    task_chat,
+            })
+        except Exception as exc:
+            log.error(f"  Judge agent failed (score=0): {exc}")
+            report = {"score": 0.0, "breakdown": {}, "error": str(exc)}
         generation_score = report["score"]
 
         _save_json(os.path.join(gen_dir, "judge_report.json"), report)
@@ -153,19 +182,36 @@ def run_phase1a(
         # 维护历史窗口（最近 8 代）
         eval_history = ([report] + eval_history)[:8]
 
+        # Symlink log files into skill dir so meta agent can read them within sandbox
+        for _fname, _src in [("task_chat.md", task_chat), ("judge_chat.md", judge_chat)]:
+            _link = os.path.join(working_skill_dir, _fname)
+            if not os.path.lexists(_link):
+                os.symlink(_src, _link)  # absolute path — works inside sandbox
+
         # ── Step 7: Meta Agent 改进 skill ─────────────────────────────────
         log.info("  Running Meta Agent...")
         meta_chat = os.path.join(gen_dir, "meta_chat.md")
-        improvement = meta_agent.propose_improvement({
-            "skill_dir":         working_skill_dir,
-            "eval_history":      eval_history,
-            "best_score":        best_score,
-            "current_score":     generation_score,
-            "stagnation_count":  stagnation_count,
-            "chat_history_file": meta_chat,
-            "task_chat_file":    task_chat,
-            "judge_chat_file":   judge_chat,
-        })
+        improvement = None
+        for _meta_attempt in range(2):
+            try:
+                improvement = meta_agent.propose_improvement({
+                    "skill_dir":         working_skill_dir,
+                    "eval_history":      eval_history,
+                    "best_score":        best_score,
+                    "current_score":     generation_score,
+                    "stagnation_count":  stagnation_count,
+                    "chat_history_file": meta_chat,
+                    "task_chat_file":    task_chat,
+                    "judge_chat_file":   judge_chat,
+                })
+                break
+            except Exception as exc:
+                log.warning(f"  Meta agent attempt {_meta_attempt + 1}/2 failed: {exc}")
+                if _meta_attempt == 0:
+                    log.info("  Retrying Meta Agent...")
+        if improvement is None:
+            log.error("  Meta agent failed after 2 attempts — skipping improvement this generation.")
+            improvement = {"applied_directly": False, "analysis": "", "changes": [], "expected_impact": "", "patch": ""}
 
         # 校验 patch 安全性 / 应用 patch
         patch_applied = False

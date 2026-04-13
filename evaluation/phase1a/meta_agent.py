@@ -109,13 +109,18 @@ META_PROMPT_TEMPLATE = """\
 ### Current Skill Documents
 
 The skill documents are in the current working directory (your CWD = the skill
-directory). Use the file system tools to inspect them:
+directory). The following reference log files are also available in your CWD:
+
+  - `task_chat.md`   — task agent execution log for this generation
+  - `judge_chat.md`  — judge agent evaluation log for this generation
+
+Use the file system tools to inspect them:
 
   ls              — list all files
   read <file>     — open and read a specific file
 
-Read the files you need before making edits. You do NOT need to read every file
-upfront — focus on the ones relevant to the diagnosed problem.
+Read the log files and skill files you need before making edits. You do NOT need
+to read every file upfront — focus on the ones relevant to the diagnosed problem.
 
 ---
 
@@ -135,26 +140,8 @@ upfront — focus on the ones relevant to the diagnosed problem.
 
 ---
 
-## Reference Files
-
-Task Agent execution log: `{task_chat_file}`
-Judge Agent full analysis: `{judge_chat_file}`
-
-These files contain the full record of what the task agent attempted and
-how the judge evaluated the results. Use them to understand where the
-task agent's output was insufficient and what skill doc improvements
-would raise the quality.
-
-⚠️ **WARNING**: These log files can be very large (100KB+). Do NOT use
-the `read` tool to open them in one shot — it may hang or time out.
-Instead, use shell commands to inspect them incrementally:
-  - `wc -l <file>` to check size first
-  - `tail -200 <file>` to see the final outcome
-  - `grep -n "error\\|Error\\|FAIL\\|fail\\|warning" <file>` to find problems
-  - `head -100 <file>` or `sed -n '500,600p' <file>` for specific ranges
-Read only the sections you need — not the entire file.
-
-Then apply your improvements and write meta_result.json.
+Based on the eval history above, read the log files in your CWD and apply your
+improvements to the skill files, then write meta_result.json.
 """
 
 STAGNATION_HINTS = {
@@ -227,8 +214,6 @@ class MetaAgent:
             current_score          = f"{inputs['current_score']:.4f}",
             stagnation_count       = stagnation_count,
             stagnation_hint        = stagnation_hint,
-            task_chat_file         = inputs.get("task_chat_file") or "(not provided)",
-            judge_chat_file        = inputs.get("judge_chat_file") or "(not provided)",
         )
 
         messages = [{"role": "user", "content": prompt}]
@@ -265,7 +250,7 @@ class MetaAgent:
         for i, report in enumerate(history):
             gen = len(history) - i
             lines.append(f"### Generation -{i} (score: {report['score']:.4f})")
-            lines.append(f"passed_threshold: {report['passed_threshold']}")
+            lines.append(f"passed_threshold: {report.get('passed_threshold', False)}")
             if report.get("failure_analysis"):
                 lines.append("**Failure analysis:**")
                 for fa in report["failure_analysis"]:

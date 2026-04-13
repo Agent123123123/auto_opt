@@ -1,8 +1,7 @@
 """
 runtime_config.py
 -----------------
-加载 runtime_config.yaml，解析每个 agent 的模型配置（model, api_base, api_key,
-extra_headers）。
+加载 runtime_config.yaml，解析每个 agent 的模型配置。
 
 用法:
     from config.runtime_config import load_agent_model_config
@@ -11,13 +10,7 @@ extra_headers）。
     judge_cfg  = load_agent_model_config("judge_agent")
     meta_cfg   = load_agent_model_config("meta_agent")
 
-    # judge_cfg: {"model": "openai/claude-sonnet-4.6", "api_base": "...",
-    #             "api_key": "<ghu_... OAuth token>", "extra_headers": {...}, ...}
-    #
-    # GitHub Copilot (api.githubcopilot.com) accepts the long-lived ghu_ OAuth
-    # token directly as Bearer — no short-lived token exchange needed.
-    # extra_headers (Copilot-Integration-Id, editor-version, etc.) are read from
-    # runtime_config.yaml and passed through to litellm / the LLM call.
+    # cfg: {"opencode_model": "bailian-coding-plan/glm-5", ...}
 """
 
 from __future__ import annotations
@@ -73,19 +66,11 @@ def load_agent_model_config(
     """
     Return the model configuration dict for a specific agent.
 
-    The returned dict is suitable for passing directly to agent classes:
+    The returned dict:
         {
-            "model":         str,          # litellm model string
-            "api_base":      str | None,
-            "api_key":       str | None,   # resolved from api_key_env
-            "extra_headers": dict | None,  # e.g. Copilot-Integration-Id headers
-            "max_tokens":    int,
-            "temperature":   float,
+            "opencode_model": str,   # e.g. "copilot-direct/claude-sonnet-4.6"
+            "_api_key_env":   str,   # env var name, for error messages
         }
-
-    For GitHub Copilot agents (api_base contains 'githubcopilot.com'):
-      - api_key is the long-lived ghu_ OAuth token from GITHUB_TOKEN — used directly
-      - extra_headers carries the required Copilot integration headers from yaml
     """
     cfg = load_runtime_config(config_path)
     agents_section: dict = cfg.get("agents", {})
@@ -97,26 +82,11 @@ def load_agent_model_config(
         )
 
     agent_raw: dict = agents_section[agent_name]
-
     api_key_env: str | None = agent_raw.get("api_key_env")
-    api_key: str | None = None
-    if api_key_env:
-        api_key = os.environ.get(api_key_env)
-
-    api_base: str | None = agent_raw.get("api_base") or None  # convert empty/null to None
-
-    extra_headers: dict | None = agent_raw.get("extra_headers") or None
 
     return {
-        "model":         agent_raw["model"],
-        "opencode_model": agent_raw.get("opencode_model", agent_raw["model"]),
-        "api_base":      api_base,
-        "api_key":       api_key,
-        "extra_headers": extra_headers,
-        "max_tokens":    int(agent_raw.get("max_tokens", 8192)),
-        "temperature":   float(agent_raw.get("temperature", 0.0)),
-        # Keep the raw env var name for debugging / error messages
-        "_api_key_env":  api_key_env,
+        "opencode_model": agent_raw["opencode_model"],
+        "_api_key_env":   api_key_env,
     }
 
 
@@ -129,7 +99,11 @@ def check_agent_api_keys(config_path: str | Path | None = None) -> dict[str, boo
     result: dict[str, bool] = {}
     for agent_name, agent_raw in cfg.get("agents", {}).items():
         env_var: str | None = agent_raw.get("api_key_env")
-        result[agent_name] = bool(env_var and os.environ.get(env_var))
+        if env_var is None:
+            # No API key required (auth managed by opencode itself)
+            result[agent_name] = True
+        else:
+            result[agent_name] = bool(os.environ.get(env_var))
     return result
 
 
@@ -140,10 +114,8 @@ if __name__ == "__main__":
     for name in ("task_agent", "judge_agent", "meta_agent"):
         try:
             mcfg = load_agent_model_config(name)
-            safe = {k: v for k, v in mcfg.items() if k != "api_key"}
-            safe["api_key"] = "***" if mcfg.get("api_key") else "(not set)"
             print(f"\n[{name}]")
-            print(json.dumps(safe, indent=2))
+            print(json.dumps(mcfg, indent=2))
         except Exception as e:
             print(f"[{name}] ERROR: {e}")
 

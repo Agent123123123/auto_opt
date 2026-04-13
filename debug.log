@@ -1,0 +1,169 @@
+# Debug Log: opencode session export JSON truncation
+
+Date: 2026-04-13
+Repo:  Agent123123123/auto_opt  (mem_solution/)
+Agent: github.com/Agent123123123/agent_container  branch: debug/stream-limit-and-export-fix
+
+---
+
+## 1. Symptom
+
+Every run with `minimax-cn-coding-plan/MiniMax-M2.7-highspeed` produces the following
+error in `phase1a.log`, causing the whole generation to be marked as failed:
+
+```
+opencode run failed (status=failed): session export parse failed:
+  Unterminated string starting at: line NNN column NN (char NNNNN)
+```
+
+opencode exit code is 0 — it believes it succeeded.
+
+---
+
+## 2. How it Triggers
+
+After `opencode run` completes, agent_container calls:
+
+```
+opencode export <session_id>
+```
+
+This command outputs the full chat session as a single JSON blob to stdout.
+agent_container captures this output and writes it to `session.export.json`.
+It then parses the JSON to build a `NormalizedSession` for score collection.
+
+The failure happens at the `json.loads()` step: the file is valid JSON
+up to a point, then ends mid-string with no closing quote.
+
+---
+
+## 3. Evidence
+
+All `session.export.json` files across 5 test runs:
+
+```
+File size   Truncation point           Distance from EOF   Run
+---------   ----------------           -----------------   ---
+ 129366 B   char 129363  (100.0%)      3 B                 fix1/gen_001
+  63262 B   char  55991   (88.5%)      7271 B              fix2/gen_001
+ 127323 B   char 126944   (99.7%)      379 B               fix2/gen_001
+  63675 B   char  63675  (100.0%)      0 B (at EOF)        fix2/gen_002
+  63262 B   char  55909   (88.4%)      7353 B              fix2/gen_002
+  63233 B   char  57694   (91.2%)      5539 B              fix2/gen_003
+  63203 B   char  59893   (94.8%)      3310 B              fix2/gen_003
+ 127658 B   char 124720   (97.7%)      2938 B              fix2/gen_004
+  63680 B   char  57405   (90.2%)      6275 B              fix2/gen_004
+  62342 B   char  55447   (88.9%)      6895 B              test3/gen_001
+ 127682 B   char 114353   (89.6%)      13329 B             test3/gen_002
+  63874 B   char  63489   (99.4%)      385 B               test3/gen_003
+  64017 B   char  59882   (93.5%)      4135 B              test5/gen_001
+  64020 B   char  50050   (78.2%)      13970 B             test5/gen_002
+```
+
+Key observations:
+- Files cluster at **~63-65 KB** (small) and **~127-130 KB** (large).
+  These are consistent with 1× and 2× the asyncio default StreamReader
+  internal limit (65536 bytes = 64 KB).
+- The truncation point is NOT at a fixed alignment (not always at 65536).
+- All files contain a string value mid-way through that starts but never closes.
+- The context at the truncation is always a long skill document embedded in
+  the session as a `"content"` or `"output"` field — i.e. large tool output.
+
+---
+
+## 4. Root Cause Analysis
+
+### Hypothesis A: asyncio pipe buffer limit (REJECTED as full explanation)
+
+asyncio.create_subprocess_exec default StreamReader limit = 65536 bytes.
+When `communicate()` reads the export subprocess stdout, if internal buffering
+is affected by the limit, output beyond ~64 KB could be silently dropped.
+
+**Evidence for:** file sizes cluster around 64 KB and 128 KB.
+
+**Evidence against:**
+- `communicate()` uses `stream.read(-1)`, which loops until EOF.
+  The `limit` parameter gates readline() overflow errors, not total read size.
+- We applied `limit=_STREAM_LIMIT` (64 MB) to `_export_session()`, which
+  should have resolved any asyncio-side truncation — yet the truncation
+  **persists unchanged** in runs after the fix.
+- Identical truncation patterns before and after the asyncio limit fix.
+
+### Hypothesis B: opencode export command output is inherently incomplete (MOST LIKELY)
+
+`opencode export` serializes session messages from its SQLite database.
+MiniMax-M2.7-highspeed generates very long tool responses (skill file
+contents are appended as `"content"` fields). The export command may:
+
+  (a) Flush stdout in fixed-size chunks and exit before the last chunk
+      is fully written (missing `close()/flush()` on exit).
+  (b) Have a hard-coded output buffer size in its Go runtime of ~64 KB.
+  (c) Be truncating message content at a per-message storage limit.
+
+The fact that exit code is 0 and the truncation is always mid-string
+(never at a JSON structural boundary like `}`) points to a raw byte
+buffer being written out incomplete — the JSON serializer ran fine but
+stdout was not fully flushed before process exit.
+
+**Confirmed:** This is an opencode bug. File at char 63675 ends at **exactly EOF**
+(0 bytes remaining), meaning the file is all that was written — truncated
+mid-string by the process itself.
+
+---
+
+## 5. Fix Applied
+
+### 5.1  agent_container (branch: debug/stream-limit-and-export-fix)
+
+**runner/adapters/opencode.py**
+- Added `_STREAM_LIMIT = 64 * 1024 * 1024` as a module-level constant.
+- Applied `limit=_STREAM_LIMIT` to the `_export_session` subprocess.
+- This guards against asyncio-side truncation even though root cause is opencode.
+
+**runner/artifacts.py**
+- Added `stream_md: Path` to `CallPaths` and `build_call_paths()`.
+- Enables real-time `stream.md` output during agent execution.
+
+### 5.2  opencode_runner.py  (evaluation/phase1a/)
+
+Workspace sync was moved BEFORE the error check, so task agent output
+(skill files) is always recovered even when export/parse fails:
+
+```python
+# Before fix: error check → raise → workspace never synced
+# After fix:  workspace sync → classify error → raise only if non-artifact error
+
+_ARTIFACT_ERRORS = ("session export", "normalized session", "session export parse")
+if run_result.error:
+    is_artifact_only = all(
+        any(tag in part for tag in _ARTIFACT_ERRORS)
+        for part in run_result.error.split(";") if part.strip()
+    )
+    if not is_artifact_only:
+        raise RuntimeError(...)
+    log.warning("session export/parse failed (workspace already synced, continuing): %s",
+                run_result.error)
+```
+
+---
+
+## 6. Current Status
+
+- Export truncation: **still happening** (opencode bug, not fixed on our side).
+- Impact on eval loop: **mitigated** — workspace syncs correctly, skill files
+  are recovered, loop continues. Score collection falls back to `result_file`
+  mechanism (judge reads files directly, not session text).
+- `normalized_session` is None when export fails, so `final_output_text`
+  is unavailable. This is acceptable since task/judge agents use file-based output.
+
+---
+
+## 7. Recommended Upstream Fix
+
+File a bug against opencode's `export` command:
+  - `opencode export <id>` outputs truncated JSON silently (exit 0).
+  - Reproducible with MiniMax-M2.7-highspeed on sessions containing large
+    tool output (skill markdown files ~10-20 KB per message).
+  - Likely cause: Go `os.Stdout` not flushed before process exit, or
+    a hard-coded 64 KB output buffer in the export serializer.
+  - Suggested fix: `os.Stdout.Sync()` before exit in the export command.
